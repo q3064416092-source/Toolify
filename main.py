@@ -1295,6 +1295,9 @@ def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
 app = FastAPI()
 http_client = httpx.AsyncClient()
 
+from admin import router as admin_router
+app.include_router(admin_router)
+
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
     """Middleware for debugging validation errors, does not log conversation content."""

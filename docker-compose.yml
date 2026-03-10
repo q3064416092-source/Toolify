@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   toolify:
-    image: ghcr.io/funnycups/toolify:latest
+    build: .
     container_name: toolify
     ports:
       - "8000:8000"

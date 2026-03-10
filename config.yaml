@@ -1,0 +1,16 @@
+server:
+  port: 8000
+  host: 0.0.0.0
+  timeout: 180
+upstream_services: []
+client_authentication:
+  allowed_keys:
+  - sk-pwd
+features:
+  enable_function_calling: true
+  log_level: INFO
+  convert_developer_to_system: true
+  key_passthrough: false
+  model_passthrough: false
+  enable_fc_error_retry: false
+  fc_error_retry_max_attempts: 3
