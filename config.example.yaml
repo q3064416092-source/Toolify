@@ -8,12 +8,14 @@ server:
   timeout: 180                  # Request timeout (seconds)
 
 # Upstream OpenAI compatible service configuration
+# Supports both OpenAI and Anthropic API formats (set api_format per service)
 upstream_services:
   - name: "openai"
     base_url: "https://api.openai.com/v1"
     api_key: "your-openai-api-key-here"
     description: "OpenAI Official Service"
     is_default: true
+    # api_format: "openai"          # API format: "openai" (default) or "anthropic"
     models:
       - "gpt-3.5-turbo"
       - "gpt-3.5-turbo-16k"
@@ -34,6 +36,20 @@ upstream_services:
       # You can also define models that can be used directly
       - "gemini-2.5-pro"
       - "gemini-2.5-flash"
+
+  # Example: Anthropic API format upstream service
+  # Uncomment to use with Claude Code or other Anthropic-compatible clients
+  # - name: "anthropic"
+  #   base_url: "https://api.anthropic.com"
+  #   api_key: "sk-ant-your-anthropic-api-key-here"
+  #   description: "Anthropic Claude Service"
+  #   is_default: false
+  #   api_format: "anthropic"               # Use Anthropic Messages API format
+  #   anthropic_version: "2023-06-01"       # Anthropic API version header
+  #   models:
+  #     - "claude-sonnet-4-20250514"
+  #     - "claude-3-5-sonnet-20241022"
+  #     - "claude-3-5-haiku-20241022"
 
 # Client authentication configuration
 client_authentication:
@@ -82,15 +98,27 @@ features:
   #   Please retry and output the function call in the correct XML format as instructed. DO NOT OUTPUT ANYTHING ELSE.
 
 # Configuration explanation:
-# 1. upstream_services: Configure multiple OpenAI compatible API services
+# 1. upstream_services: Configure multiple API services (OpenAI or Anthropic format)
 #    - name: Service name (for identification)
 #    - base_url: Base URL of the service
 #    - api_key: API key for the corresponding service
 #    - models: Complete list of models supported by the service
 #    - is_default: Whether it is the default service (used when the requested model is not in any service's model list)
 #    - description: Service description (optional)
+#    - api_format: API format - "openai" (default) or "anthropic"
+#    - anthropic_version: Anthropic API version header (default: "2023-06-01", only used when api_format is "anthropic")
 #
-# 2. Routing matching rules:
+# 2. API endpoints:
+#    - /v1/chat/completions: OpenAI-compatible endpoint (standard)
+#    - /v1/messages: Anthropic Messages API endpoint (for Claude Code CLI and other Anthropic clients)
+#    Both endpoints support function calling injection into non-supporting upstream LLMs
+#
+# 3. Claude Code CLI usage:
+#    - Set ANTHROPIC_API_KEY to your Toolify client key
+#    - Set ANTHROPIC_BASE_URL to your Toolify server URL (e.g., http://localhost:8000)
+#    - Claude Code will automatically use the /v1/messages endpoint
+#
+# 4. Routing matching rules:
 #    - The system will exactly match the corresponding service based on the model name in the request
 #    - If the model name is not in the models list of any service, the service with is_default set to true will be used
 #    - There must be one and only one service marked as is_default: true

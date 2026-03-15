@@ -1298,6 +1298,51 @@ http_client = httpx.AsyncClient()
 from admin import router as admin_router
 app.include_router(admin_router)
 
+from anthropic_adapter import (
+    AnthropicMessagesRequest,
+    anthropic_request_to_openai,
+    openai_response_to_anthropic,
+    openai_request_to_anthropic,
+    anthropic_upstream_response_to_openai,
+    openai_sse_to_anthropic_sse,
+    anthropic_sse_to_openai_sse,
+    build_anthropic_error,
+)
+
+
+def build_upstream_url_and_headers(
+    upstream: Dict[str, Any],
+    api_key: str,
+    is_stream: bool,
+) -> tuple:
+    """Build upstream URL and headers based on service api_format.
+
+    Returns (url, headers).
+    """
+    api_format = upstream.get("api_format", "openai")
+
+    if api_format == "anthropic":
+        base = upstream["base_url"].rstrip("/")
+        if base.endswith("/v1"):
+            url = f"{base}/messages"
+        else:
+            url = f"{base}/v1/messages"
+        headers = {
+            "x-api-key": upstream["api_key"],
+            "anthropic-version": upstream.get("anthropic_version", "2023-06-01"),
+            "content-type": "application/json",
+        }
+        if is_stream:
+            headers["accept"] = "text/event-stream"
+    else:
+        url = f"{upstream['base_url']}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
+            "Accept": "text/event-stream" if is_stream else "application/json",
+        }
+    return url, headers
+
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
     """Middleware for debugging validation errors, does not log conversation content."""
@@ -1383,9 +1428,19 @@ async def general_exception_handler(request: Request, exc: Exception):
         }
     )
 
-async def verify_api_key(authorization: str = Header(...)):
-    """Dependency: verify client API key"""
-    client_key = authorization.replace("Bearer ", "")
+async def verify_api_key(
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    """Dependency: verify client API key (supports both Bearer and x-api-key headers)"""
+    client_key = None
+    if x_api_key:
+        client_key = x_api_key
+    elif authorization:
+        client_key = authorization.replace("Bearer ", "")
+    else:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     if app_config.features.key_passthrough:
         # In passthrough mode, skip allowed_keys check
         return client_key
@@ -1489,7 +1544,8 @@ async def chat_completions(
         logger.debug(f"🔧 Streaming: {body.stream}")
         
         upstream, actual_model = find_upstream(body.model)
-        upstream_url = f"{upstream['base_url']}/chat/completions"
+        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, bool(body.stream))
+        api_format = upstream.get("api_format", "openai")
         
         logger.debug(f"🔧 Starting message preprocessing, original message count: {len(body.messages)}")
         processed_messages = preprocess_messages(body.messages)
@@ -1578,14 +1634,20 @@ async def chat_completions(
     prompt_tokens = token_counter.count_tokens(request_body_dict["messages"], body.model)
     logger.info(f"📊 Request to {body.model} - Actual input tokens (including all preprocessing & injected prompts): {prompt_tokens}")
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
-        "Accept": "application/json" if not body.stream else "text/event-stream"
-    }
-
-    logger.info(f"📝 Forwarding request to upstream: {upstream['name']}")
+    logger.info(f"📝 Forwarding request to upstream: {upstream['name']} (format: {api_format})")
     logger.info(f"📝 Model: {request_body_dict.get('model', 'unknown')}, Messages: {len(request_body_dict.get('messages', []))}")
+
+    # When upstream uses Anthropic format, convert the request
+    if api_format == "anthropic":
+        anthropic_body, anthropic_headers = openai_request_to_anthropic(
+            request_body_dict,
+            api_key=upstream["api_key"],
+            anthropic_version=upstream.get("anthropic_version", "2023-06-01"),
+        )
+        upstream_request_body = anthropic_body
+        headers = anthropic_headers
+    else:
+        upstream_request_body = request_body_dict
 
     if not body.stream:
         try:
@@ -1594,12 +1656,17 @@ async def chat_completions(
             logger.debug(f"🔧 Request body contains tools: {bool(body.tools)}")
             
             upstream_response = await http_client.post(
-                upstream_url, json=request_body_dict, headers=headers, timeout=app_config.server.timeout
+                upstream_url, json=upstream_request_body, headers=headers, timeout=app_config.server.timeout
             )
             upstream_response.raise_for_status() # If status code is 4xx or 5xx, raise exception
-            
+
             response_json = upstream_response.json()
             logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
+
+            # Convert Anthropic upstream response to OpenAI format for unified processing
+            if api_format == "anthropic":
+                response_json = anthropic_upstream_response_to_openai(response_json, actual_model)
+                logger.debug(f"🔧 Converted Anthropic upstream response to OpenAI format")
             
             # Count output tokens and handle usage
             completion_text = ""
@@ -1791,13 +1858,14 @@ async def chat_completions(
             
             async for chunk in stream_proxy_with_fc_transform(
                 upstream_url,
-                request_body_dict,
+                upstream_request_body,
                 headers,
                 body.model,
                 has_function_call,
                 GLOBAL_TRIGGER_SIGNAL,
                 request_body_dict["messages"],
                 tools=body.tools or [],
+                upstream_api_format=api_format,
             ):
                 # Check if this is the [DONE] marker
                 if chunk.startswith(b"data: "):
@@ -2012,14 +2080,30 @@ async def stream_proxy_with_fc_transform(
     trigger_signal: str,
     original_messages: Optional[List[Dict[str, Any]]] = None,
     tools: Optional[List["Tool"]] = None,
+    upstream_api_format: str = "openai",
 ):
     """
-    Enhanced streaming proxy, supports dynamic trigger signals, avoids misjudgment within think tags
+    Enhanced streaming proxy, supports dynamic trigger signals, avoids misjudgment within think tags.
+    Handles both OpenAI and Anthropic upstream formats.
     """
-    logger.info(f"📝 Starting streaming response from: {url}")
+    logger.info(f"📝 Starting streaming response from: {url} (format: {upstream_api_format})")
     logger.info(f"📝 Function calling enabled: {has_fc}")
 
     if not has_fc or not trigger_signal:
+        if upstream_api_format == "anthropic":
+            # For Anthropic upstream without FC, convert the stream to OpenAI format
+            try:
+                async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
+                    async def _iter_lines():
+                        async for line in response.aiter_lines():
+                            yield line
+                    async for chunk in anthropic_sse_to_openai_sse(_iter_lines(), model):
+                        yield chunk
+            except httpx.RemoteProtocolError:
+                logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
+                return
+            return
+
         try:
             async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
                 async for chunk in response.aiter_bytes():
@@ -2074,7 +2158,7 @@ async def stream_proxy_with_fc_transform(
                 error_content = await response.aread()
                 logger.error(f"❌ Upstream service stream response error: status_code={response.status_code}")
                 logger.error(f"❌ Upstream error details: {error_content.decode('utf-8', errors='ignore')}")
-                
+
                 if response.status_code == 401:
                     error_message = "Authentication failed"
                 elif response.status_code == 403:
@@ -2085,13 +2169,31 @@ async def stream_proxy_with_fc_transform(
                     error_message = "Upstream service temporarily unavailable"
                 else:
                     error_message = "Request processing failed"
-                
+
                 error_chunk = {"error": {"message": error_message, "type": "upstream_error"}}
                 yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
                 yield b"data: [DONE]\n\n"
                 return
 
-            async for line in response.aiter_lines():
+            # Normalize upstream lines: convert Anthropic SSE to OpenAI SSE lines if needed
+            if upstream_api_format == "anthropic":
+                async def _anthropic_to_openai_lines():
+                    async def _raw_lines():
+                        async for ln in response.aiter_lines():
+                            yield ln
+                    async for oai_chunk in anthropic_sse_to_openai_sse(_raw_lines(), model):
+                        for part in oai_chunk.decode("utf-8", errors="ignore").split("\n"):
+                            part = part.strip()
+                            if part:
+                                yield part
+                line_iter = _anthropic_to_openai_lines()
+            else:
+                async def _raw_line_iter():
+                    async for ln in response.aiter_lines():
+                        yield ln
+                line_iter = _raw_line_iter()
+
+            async for line in line_iter:
                 if detector.state == "tool_parsing":
                     if line.startswith("data:"):
                         line_data = line[len("data: "):].strip()
@@ -2341,6 +2443,270 @@ async def list_models(_api_key: str = Depends(verify_api_key)):
         "data": models
     }
 
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    _api_key: str = Depends(verify_api_key),
+):
+    """Anthropic Messages API endpoint – accepts Anthropic format, injects function calling, returns Anthropic format."""
+    start_time = time.time()
+
+    try:
+        raw_body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content=build_anthropic_error("invalid_request_error", "Invalid JSON body"),
+        )
+
+    # Preserve extra fields from original request (e.g. thinking config) for upstream passthrough
+    extra_request_fields = {
+        k: v for k, v in raw_body.items()
+        if k not in AnthropicMessagesRequest.model_fields and v is not None
+    }
+
+    try:
+        anthropic_req = AnthropicMessagesRequest(**raw_body)
+    except Exception as e:
+        logger.error(f"❌ Anthropic request validation failed: {e}")
+        return JSONResponse(
+            status_code=400,
+            content=build_anthropic_error("invalid_request_error", f"Invalid request: {e}"),
+        )
+
+    original_model = anthropic_req.model
+    is_streaming = bool(anthropic_req.stream)
+
+    try:
+        logger.debug(f"🔧 [Anthropic] Received request, model: {anthropic_req.model}")
+        logger.debug(f"🔧 [Anthropic] Messages: {len(anthropic_req.messages)}, Tools: {len(anthropic_req.tools) if anthropic_req.tools else 0}, Stream: {is_streaming}")
+
+        # Convert Anthropic request to OpenAI internal format
+        openai_body = anthropic_request_to_openai(anthropic_req)
+
+        upstream, actual_model = find_upstream(openai_body["model"])
+        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, is_streaming)
+        api_format = upstream.get("api_format", "openai")
+
+        openai_body["model"] = actual_model
+
+        # Preprocess messages through existing pipeline
+        processed_messages = preprocess_messages(openai_body["messages"])
+        openai_body["messages"] = processed_messages
+
+        if not validate_message_structure(processed_messages):
+            logger.error(f"❌ [Anthropic] Message structure validation failed, but continuing")
+
+        is_fc_enabled = app_config.features.enable_function_calling
+        has_tools_in_request = bool(anthropic_req.tools)
+        has_function_call = is_fc_enabled and has_tools_in_request
+
+        # Build OpenAI-format tools from the converted body
+        openai_tools = None
+        if openai_body.get("tools"):
+            openai_tools = [Tool(**t) for t in openai_body["tools"]]
+
+        if has_function_call:
+            logger.debug(f"🔧 [Anthropic] Injecting function calling prompt with trigger: {GLOBAL_TRIGGER_SIGNAL}")
+
+            tools_for_request = openai_tools or []
+            function_prompt, _ = generate_function_prompt(tools_for_request, GLOBAL_TRIGGER_SIGNAL)
+
+            tool_choice_prompt = safe_process_tool_choice(
+                openai_body.get("tool_choice"), tools_for_request
+            )
+            if tool_choice_prompt:
+                function_prompt += tool_choice_prompt
+
+            system_message = {"role": "system", "content": function_prompt}
+            openai_body["messages"].insert(0, system_message)
+
+            if "tools" in openai_body:
+                del openai_body["tools"]
+            if "tool_choice" in openai_body:
+                del openai_body["tool_choice"]
+
+        elif has_tools_in_request and not is_fc_enabled:
+            logger.info(f"🔧 [Anthropic] FC disabled, ignoring tools")
+            if "tools" in openai_body:
+                del openai_body["tools"]
+            if "tool_choice" in openai_body:
+                del openai_body["tool_choice"]
+
+        prompt_tokens = token_counter.count_tokens(openai_body["messages"], anthropic_req.model)
+        logger.info(f"📊 [Anthropic] Request to {anthropic_req.model} - Input tokens: {prompt_tokens}")
+
+    except HTTPException as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content=build_anthropic_error(
+                "invalid_request_error" if e.status_code == 400 else "authentication_error",
+                str(e.detail),
+            ),
+        )
+    except Exception as e:
+        logger.error(f"❌ [Anthropic] Request preprocessing failed: {e}")
+        return JSONResponse(
+            status_code=422,
+            content=build_anthropic_error("invalid_request_error", "Invalid request format"),
+        )
+
+    logger.info(f"📝 [Anthropic] Forwarding to upstream: {upstream['name']} (format: {api_format})")
+
+    # Prepare upstream request body based on format
+    if api_format == "anthropic":
+        upstream_request_body, headers = openai_request_to_anthropic(
+            openai_body,
+            api_key=upstream["api_key"],
+            anthropic_version=upstream.get("anthropic_version", "2023-06-01"),
+            extra_request_fields=extra_request_fields,
+        )
+    else:
+        upstream_request_body = openai_body
+
+    # --- Streaming path ---
+    if is_streaming:
+        async def _anthropic_stream():
+            """Produce Anthropic SSE events from the upstream response."""
+            async def _openai_sse_source():
+                """Yield OpenAI SSE bytes from the upstream (handles FC transform)."""
+                async for chunk in stream_proxy_with_fc_transform(
+                    upstream_url,
+                    upstream_request_body,
+                    headers,
+                    anthropic_req.model,
+                    has_function_call,
+                    GLOBAL_TRIGGER_SIGNAL,
+                    openai_body.get("messages"),
+                    tools=openai_tools or [],
+                    upstream_api_format=api_format,
+                ):
+                    yield chunk
+
+            async for event_bytes in openai_sse_to_anthropic_sse(
+                _openai_sse_source(), original_model, input_tokens=prompt_tokens
+            ):
+                yield event_bytes
+
+        return StreamingResponse(_anthropic_stream(), media_type="text/event-stream")
+
+    # --- Non-streaming path ---
+    try:
+        upstream_response = await http_client.post(
+            upstream_url, json=upstream_request_body, headers=headers,
+            timeout=app_config.server.timeout,
+        )
+        upstream_response.raise_for_status()
+
+        response_json = upstream_response.json()
+
+        # Convert Anthropic upstream response to OpenAI format for unified processing
+        if api_format == "anthropic":
+            response_json = anthropic_upstream_response_to_openai(response_json, actual_model)
+
+        # Token counting
+        completion_text = ""
+        if response_json.get("choices") and len(response_json["choices"]) > 0:
+            message = response_json["choices"][0].get("message", {})
+            content = message.get("content")
+            if content:
+                completion_text = content
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content:
+                completion_text = (completion_text + "\n" + reasoning_content).strip() if completion_text else reasoning_content
+
+        estimated_completion_tokens = token_counter.count_text_tokens(completion_text, anthropic_req.model) if completion_text else 0
+        elapsed_time = time.time() - start_time
+
+        usage = response_json.get("usage", {})
+        if not usage.get("prompt_tokens"):
+            usage["prompt_tokens"] = prompt_tokens
+        if not usage.get("completion_tokens"):
+            usage["completion_tokens"] = estimated_completion_tokens
+        if not usage.get("total_tokens"):
+            usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        response_json["usage"] = usage
+
+        logger.info("=" * 60)
+        logger.info(f"📊 [Anthropic] Token Usage - Model: {anthropic_req.model}")
+        logger.info(f"   Input: {usage.get('prompt_tokens', 0)}, Output: {usage.get('completion_tokens', 0)}, Duration: {elapsed_time:.2f}s")
+        logger.info("=" * 60)
+
+        # Parse function calls if applicable
+        if has_function_call:
+            content = response_json["choices"][0]["message"]["content"]
+            parsed_tools = await attempt_fc_parse_with_retry(
+                content=content,
+                trigger_signal=GLOBAL_TRIGGER_SIGNAL,
+                messages=openai_body["messages"],
+                upstream_url=upstream_url,
+                headers=headers,
+                model=actual_model,
+                tools=openai_tools or [],
+                timeout=app_config.server.timeout,
+            )
+            if parsed_tools:
+                tool_calls = []
+                for tool in parsed_tools:
+                    tool_call_id = f"call_{uuid.uuid4().hex}"
+                    tool_calls.append({
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "arguments": json.dumps(tool["args"]),
+                        },
+                    })
+                prefix_pos = find_last_trigger_signal_outside_think(content, GLOBAL_TRIGGER_SIGNAL)
+                prefix_text = None
+                if prefix_pos != -1:
+                    prefix_text = content[:prefix_pos].rstrip() or None
+
+                original_message = response_json["choices"][0]["message"]
+                new_message = {"role": "assistant", "content": prefix_text, "tool_calls": tool_calls}
+                for key in original_message:
+                    if key not in ("role", "content", "tool_calls"):
+                        new_message[key] = original_message[key]
+                response_json["choices"][0]["message"] = new_message
+                response_json["choices"][0]["finish_reason"] = "tool_calls"
+
+        # Convert OpenAI response to Anthropic format
+        anthropic_resp = openai_response_to_anthropic(response_json, original_model, input_tokens=prompt_tokens)
+        return JSONResponse(content=anthropic_resp)
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"❌ [Anthropic] Upstream error: status={e.response.status_code}")
+        status = e.response.status_code
+        if status == 401:
+            err_type, msg = "authentication_error", "Authentication failed with upstream"
+        elif status == 429:
+            err_type, msg = "rate_limit_error", "Rate limit exceeded"
+        elif status >= 500:
+            err_type, msg = "api_error", "Upstream service temporarily unavailable"
+        else:
+            err_type, msg = "api_error", "Request processing failed"
+        return JSONResponse(
+            status_code=status,
+            content=build_anthropic_error(err_type, msg),
+        )
+    except httpx.RequestError as e:
+        logger.error(f"❌ [Anthropic] Connection failed: {e}")
+        return JSONResponse(
+            status_code=502,
+            content=build_anthropic_error("api_error", "Failed to connect to upstream service"),
+        )
+    except Exception as e:
+        logger.error(f"❌ [Anthropic] Unexpected error: {e}")
+        logger.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content=build_anthropic_error("api_error", "Internal server error"),
+        )
 
 def validate_message_structure(messages: List[Dict[str, Any]]) -> bool:
     """Validate if message structure meets requirements"""

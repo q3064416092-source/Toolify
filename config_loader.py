@@ -24,7 +24,15 @@ class UpstreamService(BaseModel):
     models: List[str] = Field(default_factory=list, description="List of supported models")
     description: str = Field(default="", description="Service description")
     is_default: bool = Field(default=False, description="Is default service")
-    
+    api_format: str = Field(default="openai", description="API format: 'openai' or 'anthropic'")
+    anthropic_version: str = Field(default="2023-06-01", description="Anthropic API version header")
+
+    @field_validator('api_format')
+    def validate_api_format(cls, v):
+        if v not in ('openai', 'anthropic'):
+            raise ValueError("api_format must be 'openai' or 'anthropic'")
+        return v
+
     @field_validator('base_url')
     def validate_base_url(cls, v):
         if not v.startswith(('http://', 'https://')):
@@ -209,7 +217,9 @@ class ConfigLoader:
                 "base_url": service.base_url,
                 "api_key": service.api_key,
                 "description": service.description,
-                "is_default": service.is_default
+                "is_default": service.is_default,
+                "api_format": service.api_format,
+                "anthropic_version": service.anthropic_version
             }
             
             for model_entry in service.models:
@@ -234,7 +244,9 @@ class ConfigLoader:
                     "base_url": service.base_url,
                     "api_key": service.api_key,
                     "description": service.description,
-                    "is_default": service.is_default
+                    "is_default": service.is_default,
+                    "api_format": service.api_format,
+                    "anthropic_version": service.anthropic_version
                 }
         raise ValueError("No default service configured")
     

@@ -475,6 +475,7 @@ select.form-input{cursor:pointer;appearance:none;background-image:url("data:imag
                   <div class="svc-name">
                     <span x-text="svc.name"></span>
                     <span class="badge badge-green" x-show="svc.is_default">默认</span>
+                    <span class="badge" x-show="svc.api_format==='anthropic'" style="background:#d97706;color:#fff">Anthropic</span>
                   </div>
                   <div class="svc-url" x-text="svc.base_url"></div>
                   <div x-show="svc.description" style="font-size:.8rem;color:var(--text3);margin-top:.15rem" x-text="svc.description"></div>
@@ -649,6 +650,18 @@ select.form-input{cursor:pointer;appearance:none;background-image:url("data:imag
             <label class="form-label">描述</label>
             <input class="form-input" x-model="svcForm.description" placeholder="可选描述">
           </div>
+          <div class="form-group">
+            <label class="form-label">API 格式</label>
+            <select class="form-input" x-model="svcForm.api_format">
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+            <div class="form-hint">选择上游服务的 API 格式</div>
+          </div>
+          <div class="form-group" x-show="svcForm.api_format==='anthropic'">
+            <label class="form-label">Anthropic Version</label>
+            <input class="form-input" x-model="svcForm.anthropic_version" placeholder="2023-06-01">
+          </div>
           <div class="toggle-wrap" style="padding:.5rem 0;border:none">
             <div class="toggle-info"><h4>默认服务</h4></div>
             <label class="toggle"><input type="checkbox" x-model="svcForm.is_default"><span class="toggle-slider"></span></label>
@@ -724,7 +737,7 @@ function admin(){return{
   showSvcModal:false,
   editingSvc:null,
   showSvcKey:false,
-  svcForm:{name:'',base_url:'',api_key:'',description:'',is_default:false,models:[]},
+  svcForm:{name:'',base_url:'',api_key:'',description:'',is_default:false,models:[],api_format:'openai',anthropic_version:'2023-06-01'},
   newModel:'',
 
   // Keys
@@ -818,10 +831,10 @@ function admin(){return{
     this.showSvcKey=false;this.newModel='';
     if(svc){
       this.editingSvc=svc.name;
-      this.svcForm={name:svc.name,base_url:svc.base_url,api_key:svc.api_key,description:svc.description||'',is_default:!!svc.is_default,models:[...(svc.models||[])]};
+      this.svcForm={name:svc.name,base_url:svc.base_url,api_key:svc.api_key,description:svc.description||'',is_default:!!svc.is_default,models:[...(svc.models||[])],api_format:svc.api_format||'openai',anthropic_version:svc.anthropic_version||'2023-06-01'};
     }else{
       this.editingSvc=null;
-      this.svcForm={name:'',base_url:'',api_key:'',description:'',is_default:false,models:[]};
+      this.svcForm={name:'',base_url:'',api_key:'',description:'',is_default:false,models:[],api_format:'openai',anthropic_version:'2023-06-01'};
     }
     this.showSvcModal=true;
   },

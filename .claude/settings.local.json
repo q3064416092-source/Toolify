@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__filesystem__write_file",
+      "Bash(ls:*)",
+      "mcp__sequential-thinking__sequentialthinking"
+    ]
+  }
+}
