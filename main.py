@@ -8,6 +8,7 @@ import re
 import json
 import uuid
 import httpx
+import asyncio
 import secrets
 import string
 import traceback
@@ -16,7 +17,7 @@ import random
 import logging
 import tiktoken
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Any, Optional, Literal, Union
+from typing import List, Dict, Any, Optional, Literal, Union, AsyncIterator, AsyncGenerator
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -607,15 +608,37 @@ def format_tool_result_for_ai(tool_name: str, tool_arguments: str, result_conten
     Returns:
         Formatted text for upstream model
     """
-    formatted_text = f"""Tool execution result:
-- Tool name: {tool_name}
-- Tool arguments: {tool_arguments}
-- Execution result:
-<tool_result>
-{result_content}
-</tool_result>"""
-    
-    logger.debug(f"🔧 Formatted tool result for {tool_name}")
+    style = getattr(getattr(app_config, "features", None), "tool_result_style", "legacy") or "legacy"
+    style = str(style).strip().lower()
+
+    def _wrap_cdata(text: str) -> str:
+        safe = (text or "").replace("]]>", "]]]]><![CDATA[>")
+        return f"<![CDATA[{safe}]]>"
+
+    tool_name_s = str(tool_name or "")
+    tool_arguments_s = str(tool_arguments or "")
+    result_content_s = str(result_content or "")
+
+    if style == "xml":
+        formatted_text = (
+            "<tool_result>\n"
+            f"<tool_name>{_wrap_cdata(tool_name_s)}</tool_name>\n"
+            f"<tool_arguments>{_wrap_cdata(tool_arguments_s)}</tool_arguments>\n"
+            f"<result>{_wrap_cdata(result_content_s)}</result>\n"
+            "</tool_result>"
+        )
+    else:
+        formatted_text = (
+            "Tool execution result:\n"
+            f"- Tool name: {tool_name_s}\n"
+            f"- Tool arguments: {tool_arguments_s}\n"
+            "- Execution result:\n"
+            "<tool_result>\n"
+            f"{result_content_s}\n"
+            "</tool_result>"
+        )
+
+    logger.debug(f"🔧 Formatted tool result for {tool_name_s} (style={style})")
     return formatted_text
 
 def format_assistant_tool_calls_for_ai(tool_calls: List[Dict[str, Any]], trigger_signal: str) -> str:
@@ -688,6 +711,11 @@ You have access to the following available tools to help solve problems:
 3. The conversation context may already contain tool execution results from previous function calls. Review the conversation history carefully to avoid unnecessary duplicate tool calls.
 4. When tool execution results are present in the context, they will be formatted with XML tags like <tool_result>...</tool_result> for easy identification.
 5. This is the ONLY format you can use for tool calls, and any deviation will result in failure.
+6. You must NEVER pretend that you executed tools. You cannot produce any "tool runner" logs or results yourself.
+
+**CRITICAL PROHIBITIONS (Claude Code compatibility):**
+- Do NOT output any fake tool execution output such as: "Tool execution result:", "Tool execution结果：", "Edit tool succeeded", "tool_result>", "AskUserQuestion", "ExitPlanMode".
+- If you need to call tools, output ONLY the trigger signal line plus the <function_calls> XML block exactly as specified.
 
 When you need to use tools, you **MUST** strictly follow this format. Do NOT include any extra text, explanations, or dialogue on the first and second lines of the tool call syntax:
 
@@ -1343,6 +1371,188 @@ def build_upstream_url_and_headers(
         }
     return url, headers
 
+
+def _status_code_from_openai_error_type(err_type: str) -> int:
+    t = (err_type or "").strip().lower()
+    if t in ("invalid_request_error",):
+        return 400
+    if t in ("authentication_error",):
+        return 401
+    if t in ("permission_error",):
+        return 403
+    if t in ("rate_limit_error",):
+        return 429
+    if t in ("connection_error", "upstream_error", "api_error", "service_error"):
+        return 502
+    if t in ("tool_call_parse_error",):
+        return 500
+    return 500
+
+
+async def _collect_openai_sse_to_chat_completion(
+    openai_sse_stream: AsyncIterator[bytes],
+    *,
+    model: str,
+    prompt_tokens: int,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Collect an OpenAI SSE stream into a non-stream Chat Completions response.
+
+    Returns (response_json, error_json). Exactly one will be non-None.
+    """
+    stream_id: Optional[str] = None
+    created: Optional[int] = None
+    seen_model: Optional[str] = None
+    role: str = "assistant"
+    finish_reason: Optional[str] = None
+
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+
+    # For usage estimation, include raw FC content (XML) when provided by internal chunks.
+    internal_fc_raw_parts: List[str] = []
+
+    async for raw_chunk in openai_sse_stream:
+        if not raw_chunk:
+            continue
+
+        text = raw_chunk.decode("utf-8", errors="ignore")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                # End-of-stream marker
+                break
+
+            try:
+                chunk_json = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(chunk_json, dict) and chunk_json.get("error"):
+                return None, chunk_json
+
+            if isinstance(chunk_json, dict):
+                if stream_id is None:
+                    stream_id = chunk_json.get("id")
+                if created is None:
+                    created = chunk_json.get("created")
+                if seen_model is None:
+                    seen_model = chunk_json.get("model")
+
+                if chunk_json.get("object") == "chat.completion.chunk.internal":
+                    raw_fc = chunk_json.get("_internal_fc_raw_content")
+                    if isinstance(raw_fc, str) and raw_fc:
+                        internal_fc_raw_parts.append(raw_fc)
+                    continue
+
+                choices = chunk_json.get("choices") or []
+                if not choices:
+                    continue
+
+                choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice0.get("delta") or {}
+                if isinstance(delta, dict):
+                    if isinstance(delta.get("role"), str):
+                        role = delta["role"]
+
+                    c = delta.get("content")
+                    if isinstance(c, str) and c:
+                        content_parts.append(c)
+
+                    rc = delta.get("reasoning_content")
+                    if isinstance(rc, str) and rc:
+                        reasoning_parts.append(rc)
+
+                    tcs = delta.get("tool_calls")
+                    if isinstance(tcs, list):
+                        for tc in tcs:
+                            if not isinstance(tc, dict):
+                                continue
+                            idx = tc.get("index")
+                            if idx is None:
+                                continue
+                            try:
+                                idx_i = int(idx)
+                            except Exception:
+                                continue
+
+                            cur = tool_calls_by_index.get(idx_i) or {}
+                            if tc.get("id"):
+                                cur["id"] = tc.get("id")
+                            if tc.get("type"):
+                                cur["type"] = tc.get("type")
+
+                            func = tc.get("function")
+                            if isinstance(func, dict):
+                                cur_func = cur.get("function") or {}
+                                if func.get("name"):
+                                    cur_func["name"] = func.get("name")
+                                if func.get("arguments") is not None:
+                                    # In streaming, arguments may arrive incrementally; append if we already have a string.
+                                    prev = cur_func.get("arguments")
+                                    incoming = func.get("arguments")
+                                    if isinstance(prev, str) and isinstance(incoming, str):
+                                        cur_func["arguments"] = prev + incoming
+                                    else:
+                                        cur_func["arguments"] = incoming
+                                cur["function"] = cur_func
+
+                            tool_calls_by_index[idx_i] = cur
+
+                fr = choice0.get("finish_reason")
+                if isinstance(fr, str) and fr:
+                    finish_reason = fr
+
+    final_content = "".join(content_parts)
+    final_reasoning = "".join(reasoning_parts)
+    completion_text_for_usage = "".join([final_content, final_reasoning, "".join(internal_fc_raw_parts)])
+
+    completion_tokens = token_counter.count_text_tokens(completion_text_for_usage, model) if completion_text_for_usage else 0
+    usage = {
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens),
+        "total_tokens": int(prompt_tokens or 0) + int(completion_tokens),
+    }
+
+    tool_calls: List[Dict[str, Any]] = []
+    for idx in sorted(tool_calls_by_index.keys()):
+        tc = tool_calls_by_index[idx]
+        if not tc:
+            continue
+        # Strip the index field in non-stream responses.
+        out = {
+            "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+            "type": tc.get("type") or "function",
+            "function": tc.get("function") or {"name": "", "arguments": "{}"},
+        }
+        tool_calls.append(out)
+
+    message: Dict[str, Any] = {"role": role}
+    message["content"] = final_content if final_content else None
+    if final_reasoning:
+        message["reasoning_content"] = final_reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    resp = {
+        "id": stream_id or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(created) if isinstance(created, int) else int(time.time()),
+        "model": seen_model or model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+        }],
+        "usage": usage,
+    }
+    return resp, None
+
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
     """Middleware for debugging validation errors, does not log conversation content."""
@@ -1536,15 +1746,18 @@ async def chat_completions(
 ):
     """Main chat completion endpoint, proxy and inject function calling capabilities."""
     start_time = time.time()
+    force_upstream_stream = bool(getattr(app_config.features, "force_streaming_for_non_stream_requests", False))
+    client_stream = bool(body.stream)
+    upstream_stream = client_stream or force_upstream_stream
     
     try:
         logger.debug(f"🔧 Received request, model: {body.model}")
         logger.debug(f"🔧 Number of messages: {len(body.messages)}")
         logger.debug(f"🔧 Number of tools: {len(body.tools) if body.tools else 0}")
-        logger.debug(f"🔧 Streaming: {body.stream}")
+        logger.debug(f"🔧 Streaming: client={client_stream} forced_upstream={force_upstream_stream} upstream={upstream_stream}")
         
         upstream, actual_model = find_upstream(body.model)
-        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, bool(body.stream))
+        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, upstream_stream)
         api_format = upstream.get("api_format", "openai")
         
         logger.debug(f"🔧 Starting message preprocessing, original message count: {len(body.messages)}")
@@ -1557,6 +1770,8 @@ async def chat_completions(
         request_body_dict = body.model_dump(exclude_unset=True)
         request_body_dict["model"] = actual_model
         request_body_dict["messages"] = processed_messages
+        if upstream_stream:
+            request_body_dict["stream"] = True
         is_fc_enabled = app_config.features.enable_function_calling
         has_tools_in_request = bool(body.tools)
         has_function_call = is_fc_enabled and has_tools_in_request
@@ -1649,7 +1864,38 @@ async def chat_completions(
     else:
         upstream_request_body = request_body_dict
 
-    if not body.stream:
+    if not client_stream:
+        if force_upstream_stream:
+            logger.info("🧩 Non-stream client request: forcing upstream streaming and returning buffered JSON response")
+            try:
+                openai_resp, error_json = await _collect_openai_sse_to_chat_completion(
+                    stream_proxy_with_fc_transform(
+                        upstream_url,
+                        upstream_request_body,
+                        headers,
+                        body.model,
+                        has_function_call,
+                        GLOBAL_TRIGGER_SIGNAL,
+                        request_body_dict["messages"],
+                        tools=body.tools or [],
+                        upstream_api_format=api_format,
+                    ),
+                    model=body.model,
+                    prompt_tokens=prompt_tokens,
+                )
+                if error_json:
+                    err = error_json.get("error", {}) if isinstance(error_json, dict) else {}
+                    status = _status_code_from_openai_error_type(err.get("type"))
+                    return JSONResponse(content=error_json, status_code=status)
+                return JSONResponse(content=openai_resp)
+            except Exception as e:
+                logger.error(f"❌ Forced-stream non-stream request failed: {e}")
+                logger.error(traceback.format_exc())
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": "Internal server error", "type": "server_error", "code": "internal_error"}},
+                )
+
         try:
             logger.debug(f"🔧 Sending upstream request to: {upstream_url}")
             logger.debug(f"🔧 has_function_call: {has_function_call}")
@@ -1855,6 +2101,7 @@ async def chat_completions(
             done_received = False
             stream_id = None  # Keep all streamed chunks under the same id (OpenAI-compatible)
             upstream_usage_chunk = None  # Store upstream usage chunk if any
+            error_seen = False
             
             async for chunk in stream_proxy_with_fc_transform(
                 upstream_url,
@@ -1880,6 +2127,12 @@ async def chat_completions(
 
                             if stream_id is None and isinstance(chunk_json, dict):
                                 stream_id = chunk_json.get("id")
+
+                            if isinstance(chunk_json, dict) and chunk_json.get("error"):
+                                error_seen = True
+                                # Forward the error chunk and terminate the stream cleanly.
+                                yield chunk
+                                break
                             
                             if chunk_json.get("object") == "chat.completion.chunk.internal":
                                 raw_fc_content = chunk_json.get("_internal_fc_raw_content", "")
@@ -1917,6 +2170,11 @@ async def chat_completions(
                         pass
                 
                 yield chunk
+
+            if error_seen:
+                if not done_received:
+                    yield b"data: [DONE]\n\n"
+                return
             
             # Calculate our estimated tokens
             estimated_completion_tokens = token_counter.count_text_tokens(completion_text, body.model) if completion_text else 0
@@ -1986,10 +2244,7 @@ async def chat_completions(
             if done_received:
                 yield b"data: [DONE]\n\n"
         
-        return StreamingResponse(
-            stream_with_token_count(),
-            media_type="text/event-stream"
-        )
+        return StreamingResponse(stream_with_token_count(), media_type="text/event-stream")
 
 async def _attempt_streaming_fc_retry(
     original_content: str,
@@ -2100,19 +2355,44 @@ async def stream_proxy_with_fc_transform(
                     async for chunk in anthropic_sse_to_openai_sse(_iter_lines(), model):
                         yield chunk
             except httpx.RemoteProtocolError:
-                logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
+                logger.debug("🔧 Upstream closed connection prematurely, returning stream error")
+                error_chunk = {
+                    "error": {
+                        "message": "Upstream closed connection prematurely",
+                        "type": "api_error",
+                        "code": "upstream_closed",
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
                 return
             return
 
         try:
             async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+                # Normalize OpenAI upstream SSE into line-sized chunks for downstream parsers/buffering.
+                async for ln in response.aiter_lines():
+                    ln = (ln or "").strip()
+                    if not ln:
+                        continue
+                    yield (ln + "\n\n").encode("utf-8")
         except httpx.RemoteProtocolError:
-            logger.debug("🔧 Upstream closed connection prematurely, ending stream response")
+            logger.debug("🔧 Upstream closed connection prematurely, returning stream error")
+            error_chunk = {
+                "error": {
+                    "message": "Upstream closed connection prematurely",
+                    "type": "api_error",
+                    "code": "upstream_closed",
+                }
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
             return
         return
     detector = StreamingFunctionCallDetector(trigger_signal)
+    saw_upstream_done = False
+    saw_finish_reason = False
+    saw_error_chunk = False
 
     def _prepare_tool_calls(parsed_tools: List[Dict[str, Any]]):
         tool_calls = []
@@ -2151,6 +2431,24 @@ async def stream_proxy_with_fc_transform(
         chunks.append(f"data: {json.dumps(final_chunk)}\n\n")
         chunks.append("data: [DONE]\n\n")
         return chunks
+
+    def _build_error_sse_chunk(
+        message: str,
+        *,
+        error_type: str = "tool_call_parse_error",
+        code: str = "toolify_fc_parse_error",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        payload: Dict[str, Any] = {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        }
+        if details:
+            payload["error"]["details"] = details
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
     try:
         async with http_client.stream("POST", url, json=body, headers=headers, timeout=app_config.server.timeout) as response:
@@ -2194,81 +2492,113 @@ async def stream_proxy_with_fc_transform(
                 line_iter = _raw_line_iter()
 
             async for line in line_iter:
+                if line.startswith("data:"):
+                    line_data = line[len("data:"):].strip()
+                    if not line_data:
+                        continue
+                    if line_data == "[DONE]":
+                        saw_upstream_done = True
+                        break
+
+                    # Upstream may send an OpenAI-style streaming error chunk: {"error": {...}}
+                    try:
+                        upstream_chunk = json.loads(line_data)
+                    except json.JSONDecodeError:
+                        upstream_chunk = None
+
+                    if isinstance(upstream_chunk, dict) and upstream_chunk.get("error"):
+                        saw_error_chunk = True
+                        yield f"data: {json.dumps(upstream_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
+                        return
+
                 if detector.state == "tool_parsing":
                     if line.startswith("data:"):
-                        line_data = line[len("data: "):].strip()
-                        if line_data and line_data != "[DONE]":
-                            try:
-                                chunk_json = json.loads(line_data)
-                                delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
-                                detector.content_buffer += delta_content
-                                # Early termination: once </function_calls> appears, parse and finish immediately
-                                if "</function_calls>" in detector.content_buffer:
-                                    logger.debug("🔧 Detected </function_calls> in stream, finalizing early...")
-                                    parsed_tools = detector.finalize()
-                                    if parsed_tools:
-                                        validation_error = validate_parsed_tools(parsed_tools, tools or [])
-                                        if validation_error:
-                                            logger.info(f"🔧 Tool/schema validation failed in stream finalize: {validation_error}")
-                                            parsed_tools = None
+                        try:
+                            chunk_json = json.loads(line_data)
+                            if isinstance(chunk_json, dict) and chunk_json.get("error"):
+                                saw_error_chunk = True
+                                yield f"data: {json.dumps(chunk_json, ensure_ascii=False)}\n\n".encode("utf-8")
+                                yield b"data: [DONE]\n\n"
+                                return
+                            finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
+                            if finish_reason:
+                                saw_finish_reason = True
 
-                                    if parsed_tools:
-                                        logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
-                                        for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
+                            delta_content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
+                            detector.content_buffer += delta_content
+                            # Early termination: once </function_calls> appears, parse and finish immediately
+                            if "</function_calls>" in detector.content_buffer:
+                                logger.debug("🔧 Detected </function_calls> in stream, finalizing early...")
+                                parsed_tools = detector.finalize()
+                                validation_error: Optional[str] = None
+                                if parsed_tools:
+                                    validation_error = validate_parsed_tools(parsed_tools, tools or [])
+                                    if validation_error:
+                                        logger.info(f"🔧 Tool/schema validation failed in stream finalize: {validation_error}")
+                                        parsed_tools = None
+
+                                if parsed_tools:
+                                    logger.debug(f"🔧 Early finalize: parsed {len(parsed_tools)} tool calls")
+                                    for sse in _build_tool_call_sse_chunks(parsed_tools, model, detector.content_buffer):
+                                        yield sse.encode('utf-8')
+                                    return
+
+                                if app_config.features.enable_fc_error_retry and original_messages:
+                                    logger.info(f"🔄 Early finalize FC parsing failed, attempting retry...")
+                                    retry_parsed = await _attempt_streaming_fc_retry(
+                                        original_content=detector.content_buffer,
+                                        trigger_signal=trigger_signal,
+                                        messages=original_messages,
+                                        url=url,
+                                        headers=headers,
+                                        model=model,
+                                        timeout=app_config.server.timeout,
+                                        tools=tools,
+                                    )
+                                    if retry_parsed:
+                                        logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
+                                        for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
                                             yield sse.encode('utf-8')
                                         return
-                                    else:
-                                        if app_config.features.enable_fc_error_retry and original_messages:
-                                            logger.info(f"🔄 Early finalize FC parsing failed, attempting retry...")
-                                            retry_parsed = await _attempt_streaming_fc_retry(
-                                                original_content=detector.content_buffer,
-                                                trigger_signal=trigger_signal,
-                                                messages=original_messages,
-                                                url=url,
-                                                headers=headers,
-                                                model=model,
-                                                timeout=app_config.server.timeout,
-                                                tools=tools,
-                                            )
-                                            if retry_parsed:
-                                                logger.info(f"✅ Early finalize FC retry succeeded, parsed {len(retry_parsed)} tool calls")
-                                                for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
-                                                    yield sse.encode('utf-8')
-                                                return
-                                            else:
-                                                logger.warning(f"⚠️ Early finalize FC retry also failed, ending stream")
-                                        else:
-                                            logger.warning(
-                                                "⚠️ Early finalize detected </function_calls> but failed to parse tool calls; "
-                                                "silently ending stream. buffer_len=%s preview=%r",
-                                                len(detector.content_buffer),
-                                                detector.content_buffer[:200],
-                                            )
-                                        stop_chunk = {
-                                            "id": f"chatcmpl-{uuid.uuid4().hex}",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(os.path.getmtime(__file__)),
-                                            "model": model,
-                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                                        }
-                                        yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
-                                        yield b"data: [DONE]\n\n"
-                                        return
-                            except (json.JSONDecodeError, IndexError):
-                                pass
+                                    logger.warning("⚠️ Early finalize FC retry also failed")
+
+                                error_details = validation_error or _diagnose_fc_parse_error(detector.content_buffer, trigger_signal)
+                                logger.warning(
+                                    "⚠️ Early finalize detected </function_calls> but failed to parse/validate tool calls; "
+                                    "returning error. buffer_len=%s preview=%r",
+                                    len(detector.content_buffer),
+                                    detector.content_buffer[:200],
+                                )
+                                yield _build_error_sse_chunk(
+                                    "Streaming tool call parsing failed (early finalize)",
+                                    details={
+                                        "stage": "early_finalize",
+                                        "diagnosis": error_details,
+                                        "buffer_len": len(detector.content_buffer),
+                                        "buffer_preview": detector.content_buffer[:300],
+                                    },
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
+                        except (json.JSONDecodeError, IndexError):
+                            pass
                     continue
                 
                 if line.startswith("data:"):
-                    line_data = line[len("data: "):].strip()
-                    if not line_data or line_data == "[DONE]":
-                        continue
-                    
                     try:
                         chunk_json = json.loads(line_data)
+                        if isinstance(chunk_json, dict) and chunk_json.get("error"):
+                            saw_error_chunk = True
+                            yield f"data: {json.dumps(chunk_json, ensure_ascii=False)}\n\n".encode("utf-8")
+                            yield b"data: [DONE]\n\n"
+                            return
                         delta = chunk_json.get("choices", [{}])[0].get("delta", {})
                         delta_content = delta.get("content", "") or ""
                         delta_reasoning = delta.get("reasoning_content", "") or ""
                         finish_reason = chunk_json.get("choices", [{}])[0].get("finish_reason")
+                        if finish_reason:
+                            saw_finish_reason = True
                         
                         # Forward reasoning_content directly (it's not part of function call detection)
                         if delta_reasoning:
@@ -2325,6 +2655,7 @@ async def stream_proxy_with_fc_transform(
     if detector.state == "tool_parsing":
         logger.debug(f"🔧 Stream ended, starting to parse tool call XML...")
         parsed_tools = detector.finalize()
+        validation_error: Optional[str] = None
         if parsed_tools:
             validation_error = validate_parsed_tools(parsed_tools, tools or [])
             if validation_error:
@@ -2354,25 +2685,26 @@ async def stream_proxy_with_fc_transform(
                     for sse in _build_tool_call_sse_chunks(retry_parsed, model, detector.content_buffer):
                         yield sse.encode("utf-8")
                     return
-                else:
-                    logger.warning(f"⚠️ Streaming FC retry also failed, falling back to text output")
-            else:
-                logger.warning(
-                    "⚠️ Detected tool call signal but XML parsing failed; outputting accumulated text. "
-                    "buffer_len=%s preview=%r",
-                    len(detector.content_buffer),
-                    detector.content_buffer[:300],
-                )
-            
-            if detector.content_buffer:
-                content_chunk = {
-                    "id": f"chatcmpl-fallback-{uuid.uuid4().hex}",
-                    "object": "chat.completion.chunk",
-                    "created": int(os.path.getmtime(__file__)),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
-                }
-                yield f"data: {json.dumps(content_chunk)}\n\n".encode('utf-8')
+                logger.warning("⚠️ Streaming FC retry also failed")
+
+            error_details = validation_error or _diagnose_fc_parse_error(detector.content_buffer, trigger_signal)
+            logger.warning(
+                "⚠️ Detected tool call signal but XML parsing failed; returning error. "
+                "buffer_len=%s preview=%r",
+                len(detector.content_buffer),
+                detector.content_buffer[:300],
+            )
+            yield _build_error_sse_chunk(
+                "Streaming tool call parsing failed",
+                details={
+                    "stage": "stream_end",
+                    "diagnosis": error_details,
+                    "buffer_len": len(detector.content_buffer),
+                    "buffer_preview": detector.content_buffer[:300],
+                },
+            )
+            yield b"data: [DONE]\n\n"
+            return
 
     elif detector.state == "detecting" and detector.content_buffer:
         # If stream has ended but buffer still has remaining characters insufficient to form signal, output them
@@ -2382,16 +2714,45 @@ async def stream_proxy_with_fc_transform(
             "choices": [{"index": 0, "delta": {"content": detector.content_buffer}}]
         }
         yield f"data: {json.dumps(final_yield_chunk)}\n\n".encode('utf-8')
-    
-    stop_chunk = {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion.chunk",
-        "created": int(os.path.getmtime(__file__)),
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-    }
-    yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
+
+    if saw_finish_reason:
+        yield b"data: [DONE]\n\n"
+        return
+
+    if saw_error_chunk:
+        yield b"data: [DONE]\n\n"
+        return
+
+    if saw_upstream_done:
+        stop_chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(os.path.getmtime(__file__)),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
+        yield b"data: [DONE]\n\n"
+        return
+
+    logger.warning(
+        "⚠️ Upstream stream ended without [DONE] or finish_reason; returning error. "
+        "buffer_len=%s preview=%r",
+        len(detector.content_buffer),
+        detector.content_buffer[:200],
+    )
+    yield _build_error_sse_chunk(
+        "Upstream stream ended unexpectedly (missing [DONE])",
+        error_type="upstream_error",
+        code="upstream_truncated_stream",
+        details={
+            "stage": "upstream_truncated",
+            "buffer_len": len(detector.content_buffer),
+            "buffer_preview": detector.content_buffer[:300],
+        },
+    )
     yield b"data: [DONE]\n\n"
+    return
 
 
 @app.get("/")
@@ -2455,6 +2816,7 @@ async def anthropic_messages(
 ):
     """Anthropic Messages API endpoint – accepts Anthropic format, injects function calling, returns Anthropic format."""
     start_time = time.time()
+    force_upstream_stream = bool(getattr(app_config.features, "force_streaming_for_non_stream_requests", False))
 
     try:
         raw_body = await request.json()
@@ -2480,17 +2842,24 @@ async def anthropic_messages(
         )
 
     original_model = anthropic_req.model
-    is_streaming = bool(anthropic_req.stream)
+    client_stream = bool(anthropic_req.stream)
+    upstream_stream = client_stream or force_upstream_stream
 
     try:
         logger.debug(f"🔧 [Anthropic] Received request, model: {anthropic_req.model}")
-        logger.debug(f"🔧 [Anthropic] Messages: {len(anthropic_req.messages)}, Tools: {len(anthropic_req.tools) if anthropic_req.tools else 0}, Stream: {is_streaming}")
+        logger.debug(
+            f"🔧 [Anthropic] Messages: {len(anthropic_req.messages)}, "
+            f"Tools: {len(anthropic_req.tools) if anthropic_req.tools else 0}, "
+            f"Stream: client={client_stream} forced_upstream={force_upstream_stream} upstream={upstream_stream}"
+        )
 
         # Convert Anthropic request to OpenAI internal format
         openai_body = anthropic_request_to_openai(anthropic_req)
+        if upstream_stream:
+            openai_body["stream"] = True
 
         upstream, actual_model = find_upstream(openai_body["model"])
-        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, is_streaming)
+        upstream_url, headers = build_upstream_url_and_headers(upstream, _api_key, upstream_stream)
         api_format = upstream.get("api_format", "openai")
 
         openai_body["model"] = actual_model
@@ -2569,10 +2938,88 @@ async def anthropic_messages(
     else:
         upstream_request_body = openai_body
 
-    # --- Streaming path ---
-    if is_streaming:
+    if not client_stream:
+        if force_upstream_stream:
+            logger.info("🧩 [Anthropic] Non-stream client request: forcing upstream streaming and returning buffered JSON response")
+            try:
+                openai_resp, error_json = await _collect_openai_sse_to_chat_completion(
+                    stream_proxy_with_fc_transform(
+                        upstream_url,
+                        upstream_request_body,
+                        headers,
+                        anthropic_req.model,
+                        has_function_call,
+                        GLOBAL_TRIGGER_SIGNAL,
+                        openai_body.get("messages"),
+                        tools=openai_tools or [],
+                        upstream_api_format=api_format,
+                    ),
+                    model=anthropic_req.model,
+                    prompt_tokens=prompt_tokens,
+                )
+                if error_json:
+                    err = error_json.get("error", {}) if isinstance(error_json, dict) else {}
+                    status = _status_code_from_openai_error_type(err.get("type"))
+                    err_type = err.get("type") or "api_error"
+                    atype = err_type if err_type in ("invalid_request_error", "authentication_error", "permission_error", "rate_limit_error", "api_error", "overloaded_error") else "api_error"
+                    msg_parts = [err.get("message") or "Request failed"]
+                    if err.get("code"):
+                        msg_parts.append(f"[code: {err.get('code')}]")
+                    details = err.get("details")
+                    if isinstance(details, dict) and details.get("diagnosis"):
+                        msg_parts.append(f"Diagnosis: {details.get('diagnosis')}")
+                    return JSONResponse(
+                        status_code=status,
+                        content=build_anthropic_error(atype, " ".join([p for p in msg_parts if p])),
+                    )
+
+                anthropic_resp = openai_response_to_anthropic(openai_resp, original_model, input_tokens=prompt_tokens)
+                return JSONResponse(content=anthropic_resp)
+            except Exception as e:
+                logger.error(f"❌ [Anthropic] Forced-stream non-stream request failed: {e}")
+                logger.error(traceback.format_exc())
+                return JSONResponse(
+                    status_code=500,
+                    content=build_anthropic_error("api_error", "Internal server error"),
+                )
+
+        # Fall through to the normal non-streaming path below
+    else:
+        # --- Streaming path ---
         async def _anthropic_stream():
             """Produce Anthropic SSE events from the upstream response."""
+            keepalive_s = int(getattr(app_config.features, "stream_keepalive_seconds", 0) or 0)
+
+            async def _with_keepalive(
+                event_stream: AsyncIterator[bytes],
+                interval_s: int,
+            ) -> AsyncGenerator[bytes, None]:
+                if interval_s <= 0:
+                    async for ev in event_stream:
+                        yield ev
+                    return
+
+                # Emit Anthropic ping events if the upstream is silent for too long.
+                aiter = event_stream.__aiter__()
+                pending = asyncio.create_task(aiter.__anext__())
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({pending}, timeout=interval_s)
+                        if not done:
+                            yield b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+                            continue
+
+                        try:
+                            ev = pending.result()
+                        except StopAsyncIteration:
+                            return
+
+                        yield ev
+                        pending = asyncio.create_task(aiter.__anext__())
+                finally:
+                    if pending and not pending.done():
+                        pending.cancel()
+
             async def _openai_sse_source():
                 """Yield OpenAI SSE bytes from the upstream (handles FC transform)."""
                 async for chunk in stream_proxy_with_fc_transform(
@@ -2588,9 +3035,10 @@ async def anthropic_messages(
                 ):
                     yield chunk
 
-            async for event_bytes in openai_sse_to_anthropic_sse(
+            event_iter = openai_sse_to_anthropic_sse(
                 _openai_sse_source(), original_model, input_tokens=prompt_tokens
-            ):
+            )
+            async for event_bytes in _with_keepalive(event_iter, keepalive_s):
                 yield event_bytes
 
         return StreamingResponse(_anthropic_stream(), media_type="text/event-stream")

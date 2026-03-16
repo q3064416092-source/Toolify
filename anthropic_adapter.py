@@ -665,6 +665,15 @@ async def openai_sse_to_anthropic_sse(
     current_block_type: Optional[str] = None
     total_output_tokens = 0
     last_stop_reason = "end_turn"
+    anthropic_error_types = {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+    }
 
     def _event(event_type: str, data: dict) -> bytes:
         return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
@@ -718,6 +727,35 @@ async def openai_sse_to_anthropic_sse(
                 chunk = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+
+            # Map OpenAI-style SSE error chunks to Anthropic `event: error` for Claude Code.
+            if isinstance(chunk, dict) and chunk.get("error"):
+                err_obj = chunk.get("error")
+                if isinstance(err_obj, dict):
+                    msg = err_obj.get("message") or str(err_obj)
+                    err_type = err_obj.get("type") or "api_error"
+                    err_code = err_obj.get("code")
+                    err_details = err_obj.get("details")
+                else:
+                    msg = str(err_obj)
+                    err_type = "api_error"
+                    err_code = None
+                    err_details = None
+
+                atype = err_type if err_type in anthropic_error_types else "api_error"
+                msg_parts = [msg]
+                if err_type and err_type not in anthropic_error_types:
+                    msg_parts.append(f"[type: {err_type}]")
+                if err_code:
+                    msg_parts.append(f"[code: {err_code}]")
+                if isinstance(err_details, dict) and err_details.get("diagnosis"):
+                    msg_parts.append(f"Diagnosis: {err_details.get('diagnosis')}")
+
+                yield _event("error", {
+                    "type": "error",
+                    "error": {"type": atype, "message": " ".join([p for p in msg_parts if p])},
+                })
+                return
 
             # Skip internal metadata chunks
             if chunk.get("object") == "chat.completion.chunk.internal":

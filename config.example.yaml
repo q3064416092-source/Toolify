@@ -64,6 +64,9 @@ features:
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
   key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
   model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
+  tool_result_style: "legacy"      # Tool result formatting: "legacy" (default) or "xml" (recommended for Claude Code)
+  stream_keepalive_seconds: 0      # For /v1/messages streaming: emit periodic Anthropic `ping` events if upstream is silent (0 disables)
+  force_streaming_for_non_stream_requests: false  # If true, non-stream requests are forced to upstream stream=true, then buffered and returned as non-stream JSON
   
   # Custom prompt template (optional). If not provided, the default prompt will be used.
   # The default prompt includes comprehensive features:

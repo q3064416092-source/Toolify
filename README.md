@@ -114,6 +114,9 @@ Refer to [`config.example.yaml`](config.example.yaml) for detailed configuration
 - **`features`**: Toggle features like logging, role conversion, and API key handling.
   - `key_passthrough`: Set to`true`to directly forward the client-provided API key to the upstream service, bypassing the configured`api_key`in`upstream_services`.
   - `model_passthrough`: Set to`true`to forward all requests directly to the upstream service named 'openai', ignoring any model-based routing rules.
+  - `tool_result_style`: Tool result formatting for upstream context. Use `xml` to reduce "tool runner" imitation in Claude Code; default is `legacy` for compatibility.
+  - `stream_keepalive_seconds`: For `/v1/messages` streaming, emit Anthropic `ping` events every N seconds when upstream is silent (0 disables).
+  - `force_streaming_for_non_stream_requests`: If enabled, force upstream `stream=true` even when the client uses `stream=false`, then buffer and return a normal (non-SSE) JSON response.
   - `prompt_template`: Customize the system prompt used to instruct the model on how to use tools.
   - `enable_fc_error_retry`: Set to`true`to enable automatic retry when function call parsing fails.
   - `fc_error_retry_max_attempts`: Maximum retry attempts (1-10, default: 3).

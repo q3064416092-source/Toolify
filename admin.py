@@ -570,6 +570,28 @@ select.form-input{cursor:pointer;appearance:none;background-image:url("data:imag
               </div>
               <label class="toggle"><input type="checkbox" x-model="feat.enable_fc_error_retry" @change="saveFeatures()"><span class="toggle-slider"></span></label>
             </div>
+            <div class="toggle-wrap">
+              <div class="toggle-info">
+                <h4>强制流式响应</h4>
+                <p>即使客户端 stream=false，也强制上游使用 stream=true，待流式结束后再以非流式 JSON 返回（假非流式）</p>
+              </div>
+              <label class="toggle"><input type="checkbox" x-model="feat.force_streaming_for_non_stream_requests" @change="saveFeatures()"><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+          <div class="card">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">工具结果格式 <span style="color:var(--text3);font-weight:400">(Claude Code 推荐 xml)</span></label>
+                <select class="form-input" x-model="feat.tool_result_style" @change="saveFeatures()">
+                  <option value="legacy">legacy</option>
+                  <option value="xml">xml</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">流式 Keepalive（秒） <span style="color:var(--text3);font-weight:400">(仅 /v1/messages，0 关闭)</span></label>
+                <input type="number" class="form-input" min="0" x-model.number="feat.stream_keepalive_seconds" @change="saveFeatures()" placeholder="0">
+              </div>
+            </div>
           </div>
           <div class="card">
             <div class="form-row">
@@ -727,6 +749,9 @@ function admin(){return{
     convert_developer_to_system:true,
     key_passthrough:false,
     model_passthrough:false,
+    tool_result_style:'legacy',
+    stream_keepalive_seconds:0,
+    force_streaming_for_non_stream_requests:false,
     enable_fc_error_retry:false,
     fc_error_retry_max_attempts:3,
     prompt_template:null,
@@ -757,6 +782,7 @@ function admin(){return{
       {label:'角色转换',on:f.convert_developer_to_system!==false},
       {label:'密钥透传',on:!!f.key_passthrough},
       {label:'模型透传',on:!!f.model_passthrough},
+      {label:'强制流式',on:!!f.force_streaming_for_non_stream_requests},
       {label:'错误重试',on:!!f.enable_fc_error_retry},
     ];
   },
@@ -803,6 +829,9 @@ function admin(){return{
         convert_developer_to_system:f.convert_developer_to_system!==false,
         key_passthrough:!!f.key_passthrough,
         model_passthrough:!!f.model_passthrough,
+        tool_result_style:f.tool_result_style||'legacy',
+        stream_keepalive_seconds:typeof f.stream_keepalive_seconds==='number' ? f.stream_keepalive_seconds : (parseInt(f.stream_keepalive_seconds)||0),
+        force_streaming_for_non_stream_requests:!!f.force_streaming_for_non_stream_requests,
         enable_fc_error_retry:!!f.enable_fc_error_retry,
         fc_error_retry_max_attempts:f.fc_error_retry_max_attempts||3,
         prompt_template:f.prompt_template||null,

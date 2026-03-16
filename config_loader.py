@@ -78,6 +78,12 @@ class FeaturesConfig(BaseModel):
     prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function calling")
     key_passthrough: bool = Field(default=False, description="If true, directly forward client-provided API key to upstream instead of using configured upstream key")
     model_passthrough: bool = Field(default=False, description="If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing")
+    tool_result_style: str = Field(default="legacy", description="Tool result formatting style: 'legacy' or 'xml'")
+    stream_keepalive_seconds: int = Field(default=0, ge=0, description="Streaming keepalive ping interval in seconds (0 disables)")
+    force_streaming_for_non_stream_requests: bool = Field(
+        default=False,
+        description="If true, force upstream streaming for non-stream requests and buffer back a non-stream JSON response",
+    )
     
     # Function calling error retry configuration
     enable_fc_error_retry: bool = Field(default=False, description="Enable automatic retry when function call parsing fails")
@@ -96,6 +102,15 @@ class FeaturesConfig(BaseModel):
         if v:
             if "{tools_list}" not in v or "{trigger_signal}" not in v:
                 raise ValueError("prompt_template must contain {tools_list} and {trigger_signal} placeholders")
+        return v
+
+    @field_validator('tool_result_style')
+    def validate_tool_result_style(cls, v):
+        if not v:
+            return "legacy"
+        v = str(v).strip().lower()
+        if v not in ("legacy", "xml"):
+            raise ValueError("tool_result_style must be 'legacy' or 'xml'")
         return v
 
     @field_validator('fc_error_retry_prompt_template')
