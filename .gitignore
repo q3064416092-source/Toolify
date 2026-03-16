@@ -21,3 +21,15 @@ env/
 # 操作系统生成文件
 .DS_Store
 Thumbs.db
+
+# Claude Code 相关
+.claude/
+CLAUDE.md
+0_AGENT_STATE.md
+0_TODO.md
+
+# 测试文件夹
+tests/
+
+# 用户文档
+User.md
